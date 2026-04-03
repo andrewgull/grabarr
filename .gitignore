@@ -1,0 +1,26 @@
+# IDEs
+.idea/
+.vscode/
+
+# R stuff
+.Rhistory
+*.RData
+
+# pixi environments
+.pixi/
+!.pixi/config.toml
+
+# cache
+__pycache__/
+.pytest_cache/
+
+# other
+.DS_Store
+CLAUDE.md
+*.html
+
+# genomes
+*.fna
+*.fasta
+*.fai
+*.bed

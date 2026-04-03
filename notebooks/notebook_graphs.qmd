@@ -1,0 +1,685 @@
+---
+title: "Graph-based Repeat Resolution (grabrr)"
+author: "A.G."
+date: "`r Sys.Date()`"
+format:
+  html:
+    self-contained: true
+    theme: "cosmo"
+    df-print: paged
+    toc: true
+    toc-location: left
+    toc-float: true
+    code-fold: true
+---
+
+```{r}
+#| message: false
+#| echo: false
+library(dplyr)
+library(ggplot2)
+library(igraph)
+library(tidyr)
+```
+
+# Introduction
+
+Using BLAST it is possible to discover repeated sequences in a genome in a fast and efficient way.
+The question is how to make a sense out of BLAST output, i.e. how to turn repeated matches in repeat instances with coordinates
+
+My aim is to
+
+  - get borders/coordinates of each repeated unit,
+  - output repeated unit as fasta string,
+  - find families of repeated units
+
+This is Part 2, the first attempts of applying unsupervised learning to BLAST results can be found in `notebooks/old/notebook_unsupervised_learning.Rmd`
+
+# Create a random genome with 3 types of repeats in several positions each
+
+```{bash}
+#| eval: false
+pixi run python scripts/gr_generator.py -gl 100000 -r 30:1000,5000,90000 -
+r 50:40000,50000 -r 12:80000,20000,2000,500,70000 -o data/fasta/generated/genome_string_exact_repeats.fa
+
+# run blast
+pixi run blastn -query data/fasta/generated/genome_string_exact_repeats.fa -subject data/fasta/generated/genome_string_exact_repeats.fa -outfmt 6 -dust no > data/tables/blast_genome_string_exact_repeats.tsv
+```
+
+## Read blast results
+
+```{r}
+blast_3tIR <- read.delim("../data/tables/blast_genome_string_exact_repeats.tsv", header = FALSE)
+blast_3tIR <- blast_3tIR[-1, ]
+blast_3tIR$observation <- rownames(blast_3tIR)
+blast_3tIR
+```
+
+## Plot the resuts
+
+```{r}
+#| fig-height: 3
+#| fig-width: 6
+ggplot(blast_3tIR, aes(V7, V8)) +
+  geom_jitter(alpha = 0.5, aes(size = V4)) +
+  coord_trans(y = "sqrt", x = "sqrt") +
+  xlab("start") +
+  ylab("end")
+```
+Now, what you should find is two clusters, corresponding to two kinds of repeats
+
+### Clustering
+
+```{r}
+mtrx.3tIR <- as.matrix(blast_3tIR %>% select(V7, V8))
+
+dist.3tIR <- dist(mtrx.3tIR)
+
+hc.3tIR <- hclust(dist.3tIR, method = "average")
+plot(hc.3tIR)
+```
+
+This clustering is wrong because observations 2 and 3 must form a single cluster, 4-9 another one and the rest - the third cluster.
+
+# Graph (network) based clustering
+
+Connections between repeat copies are defined by columns 8-10 in a blast table. Each row represents a pair of connected copies, I need translate it into a graph-like object (igraph tutorial [here](https://kateto.net/netscix2016.html))
+
+Questions:
+
+1. How to build a graph from a blast table?
+2. What clustering algorithm to use?
+
+Observations 2 and 3 constitute Cluster 1, observations 4-15 constitute Cluster 2
+
+## Graph attributes
+
+I can add attributes to each vertex or edge (for example, coordinates, or length - which also may represent stronger connections), similarity percentage may work as edge weight (higher weight means stronger connections)
+
+Edges:
+
+- similarity percentage
+
+Vertices:
+
+- length (make vertex bigger on a plot)
+- coordinates
+
+Being interpreted as weights attributes mean stronger connections
+
+## Build a graph from a blast table
+
+```{r}
+#| eval: false
+# if each pair has the same coordinates then the following should work
+blast_3tIR %>%
+  filter(5989 == V9 & 6050 == V10) %>%
+  select(observation)
+
+# APPLY to rows DOESN'T WORK (it "skips" some rows)
+apply(blast_3tIR, 1, function(row) {
+  obs <- unname(row[13])
+  subdf <- filter(blast_3tIR, V9 == row[7] & V10 == row[8])
+  print(obs)
+  for (i in subdf$observation) {
+    print(paste(unname(obs), i, sep = " -> "))
+  }
+  # print(obs)
+  # print(subdf)
+})
+```
+
+```{r}
+# THIS works
+pairs.vec <- c()
+acc <- 20 # defines how precise blast hist should be
+
+for (i in c(1:nrow(blast_3tIR))) {
+  obs <- unname(blast_3tIR[i, 13])
+  subdf <- filter(blast_3tIR, (blast_3tIR[i, 7] < (V9 + acc) & blast_3tIR[i, 7] > (V9 - acc)) & (blast_3tIR[i, 8] < (V10 + acc) & blast_3tIR[i, 8] > (V10 - acc)))
+  for (j in subdf$observation) {
+    # print(paste(unname(obs), j, sep = " -> "))
+    pairs.vec <- c(pairs.vec, obs, j)
+  }
+}
+```
+
+
+Make a matrix
+
+```{r}
+pairs.mtrx <- matrix(pairs.vec, ncol = 2, byrow = T)
+pairs.mtrx
+```
+
+Use this matrix to build a graph
+
+### A universal function
+
+```{r}
+find_row_match <- function(blast_df, accuracy, row_number) {
+  # find matches of a given row:
+  # start (7th column) within V9 +- accuracy
+  # end (8th column) within V10 +- accuracy
+  subdf.fwd <- filter(blast_df, (blast_df[row_number, 7] < (V9 + accuracy) & blast_df[row_number, 7] > (V9 - accuracy)) &
+    (blast_df[row_number, 8] < (V10 + accuracy) & blast_df[row_number, 8] > (V10 - accuracy)))
+  # the opposite for reverse hits:
+  # start (7th column) within V10 +- accuracy
+  # end (8th column) within V9 +- accuracy
+  subdf.rev <- filter(blast_df, (blast_df[row_number, 7] < (V10 + accuracy) & blast_df[row_number, 7] > (V10 - accuracy)) &
+    (blast_df[row_number, 8] < (V9 + accuracy) & blast_df[row_number, 8] > (V9 - accuracy)))
+  # join forward and reverse subdf
+  subdf <- rbind(subdf.fwd, subdf.rev)
+  # put found observation names in a vector
+  for (j in subdf$observation) {
+    pairs.vec <- c(pairs.vec, obs, j)
+  }
+  return(pairs.vec)
+}
+
+blast2matrix <- function(blast_df, accuracy = 10, relative = TRUE) {
+  # blast_df: a data frame with blast results
+  # accuracy: allowed difference between
+  # relative: treat accuracy parameter as percentage not as a number of base pairs
+  # return: pairwise matrix of hits correspondence
+  #################################################
+  if (relative == T) {
+    # iterate through rows
+    for (i in c(1:nrow(blast_df))) {
+      # get observation name as character
+      obs <- unname(blast_df[i, 13])
+      # translate accuracy if it's relative
+      acc <- accuracy / 100 * blast_df[i, 4]
+      # get a vector of matches of a given row
+      vector_pairs <- find_row_match(blast_df, acc, i)
+    }
+  } else {
+    # accuracy is not relative but represents absolute length
+    # iterate through rows
+    for (i in c(1:nrow(blast_df))) {
+      # get observation name as character
+      obs <- unname(blast_df[i, 13])
+      # get a vector of matches of a given row
+      vector_pairs <- find_row_match(blast_df, accuracy, i)
+    }
+  }
+  # make a pairwise matrix from the vector
+  pairs.mtrx <- matrix(vector_pairs, ncol = 2, byrow = T)
+  return(pairs.mtrx)
+}
+```
+
+
+### A function to make a pairs matrix
+
+```{r}
+blast2matrix_for <- function(blast_df, accuracy) {
+  # forward matches
+  pairs.vec <- c()
+  for (i in c(1:nrow(blast_df))) {
+    obs <- unname(blast_df[i, 13])
+    subdf <- filter(blast_df, (blast_df[i, 7] < (V9 + accuracy) & blast_df[i, 7] > (V9 - accuracy)) & (blast_df[i, 8] < (V10 + accuracy) & blast_df[i, 8] > (V10 - accuracy)))
+    for (j in subdf$observation) {
+      pairs.vec <- c(pairs.vec, obs, j)
+    }
+  }
+
+  pairs.mtrx <- matrix(pairs.vec, ncol = 2, byrow = T)
+  return(pairs.mtrx)
+}
+
+
+blast2matrix_rev <- function(blast_df, accuracy) {
+  # reversed matches
+  pairs.vec <- c()
+  for (i in c(1:nrow(blast_df))) {
+    obs <- unname(blast_df[i, 13])
+    subdf <- filter(blast_df, (blast_df[i, 7] < (V10 + accuracy) & blast_df[i, 7] > (V10 - accuracy)) & (blast_df[i, 8] < (V9 + accuracy) & blast_df[i, 8] > (V9 - accuracy)))
+    for (j in subdf$observation) {
+      pairs.vec <- c(pairs.vec, obs, j)
+    }
+  }
+
+  pairs.mtrx <- matrix(pairs.vec, ncol = 2, byrow = T)
+  return(pairs.mtrx)
+}
+```
+
+### A function to make a pairs matrix with flexible accuracy
+
+```{r}
+blast2matrix.for.flex <- function(blast_df, accuracy_percent = 0.1) {
+  # forward matches
+  pairs.vec <- c()
+  for (i in c(1:nrow(blast_df))) {
+    # accuracy depends on length and percentage
+    accuracy <- accuracy_percent * blast_df[i, 4]
+    obs <- unname(blast_df[i, 13])
+    subdf <- filter(blast_df, (blast_df[i, 7] < (V9 + accuracy) & blast_df[i, 7] > (V9 - accuracy)) & (blast_df[i, 8] < (V10 + accuracy) & blast_df[i, 8] > (V10 - accuracy)))
+    for (j in subdf$observation) {
+      pairs.vec <- c(pairs.vec, obs, j)
+    }
+  }
+
+  pairs.mtrx <- matrix(pairs.vec, ncol = 2, byrow = T)
+  return(pairs.mtrx)
+}
+
+
+blast2matrix.rev.flex <- function(blast_df, accuracy_percent = 0.1) {
+  # reversed matches
+  pairs.vec <- c()
+  for (i in c(1:nrow(blast_df))) {
+    # accuracy depends on length and percentage
+    accuracy <- accuracy_percent * blast_df[i, 4]
+    obs <- unname(blast_df[i, 13])
+    subdf <- filter(blast_df, (blast_df[i, 7] < (V10 + accuracy) & blast_df[i, 7] > (V10 - accuracy)) & (blast_df[i, 8] < (V9 + accuracy) & blast_df[i, 8] > (V9 - accuracy)))
+    for (j in subdf$observation) {
+      pairs.vec <- c(pairs.vec, obs, j)
+    }
+  }
+
+  pairs.mtrx <- matrix(pairs.vec, ncol = 2, byrow = T)
+  return(pairs.mtrx)
+}
+```
+
+
+### A function to create node attributes from a blast table
+
+```{r}
+### some code here
+```
+
+### Toy data set graph
+
+There should be 3 clusters representing 3 types of repeats:
+
+- observations 2 and 3 -> cluster 1
+
+- obs. 4-9 -> cluster 2
+
+- obs. 10-21 -> cluster 3
+
+```{r}
+#| message: false
+#| warning: false
+acc <- 7
+toy.mtrx <- blast2matrix_for(blast_3tIR, acc)
+g3tIR <- graph_from_edgelist(toy.mtrx)
+plot(g3tIR, main = paste0("accuracy=", acc), vertex.size = 8, vertex.label.dist = 1.5, edge.arrow.size = .5)
+```
+
+Accuracy score 7 is the minimal accuracy that gives you true number of clusters, maximum accuracy that I've checked is 100 (it gives 3 clusters).
+
+## Graph clustering
+
+### Subgroups and communities
+
+[Source](https://kateto.net/netscix2016.html)
+
+There is a number of algorithms aim to detect groups that consist of densely connected nodes with fewer connections across groups.
+
+Below are the methods that work on the toy data set "out of the box"
+
+#### Community detection based on propagating labels
+
+Assigns node labels, randomizes, than replaces each vertex's label with the label that appears most frequently among neighbors. Those steps are repeated until each vertex has the most common label of its neighbors.
+
+A fast nearly linear time algorithm for detecting community structure in networks
+
+```{r}
+clp <- cluster_label_prop(g3tIR)
+
+plot(clp, g3tIR)
+```
+
+#### Cluster infomap
+
+Finds community structure, that minimizes the expected description length of a random walker trajectory
+
+Rosvall & Bergstrom, PNAS, 2008
+Rosvall, Axelsson and Bergstrom, Eur. Phys. J. Special Topics, 2009
+
+```{r}
+cinfo <- cluster_infomap(g3tIR)
+plot(cinfo, g3tIR)
+```
+
+## Number disconnected graphs
+
+Instead of clustering, I just need a number of disconnected components. Each component represents one type of repeat.
+
+### Find connected components of a graph
+
+Calculate the maximal (weakly or strongly) connected components of a graph
+
+```{r}
+count_components(g3tIR, mode = "weak")
+```
+
+```{r}
+components(g3tIR, mode = "weak")
+```
+Number of components corresponds to the number of repeat types
+
+### Decompose graph into components
+
+Creates a separate graph for each component of a graph
+
+```{r}
+g3tIR.decomp <- decompose(g3tIR, mode = "weak")
+g3tIR.decomp
+```
+
+### How to find number of copies?
+
+If I have **n** copies of a repeat and **perfect accuracy of blast algorithm**, then I get *n(n-1)* pairs (observations) in a blast table or vertices in a graph.
+
+So, number of vertices *V* is:
+
+$V = n(n-1)$ or $V = n^2 - n$
+
+and each observation (=row) has *n-1* connections with other rows, so, the number of edges *E* is:
+
+$E = V(n -1)$
+
+then $\frac{V}{E} = \frac{n(n-1)}{V(n-1)}$
+
+then $\frac{V}{E} = \frac{n}{V}$
+
+then $n = \frac{V^2}{E}$
+
+for my toy data (2 types of repeats, 2 and 4 copies) set *n = 144/36 = 4*
+
+---
+
+In a fully connected graph $E = \frac{n(n-1)}{2}$ where n is number of vertices!
+
+
+```{r}
+V(g3tIR.decomp[[2]])
+```
+
+
+```{r}
+E(g3tIR.decomp[[2]])
+```
+
+```{r}
+plot(g3tIR.decomp[[2]])
+```
+
+**N.B.**
+
+1. obs.4 does not point to obs.6 (which is true - see the table), which means that my idea that every observation must point to every other observation is wrong (I mixed up *observations* and *copies*!) - in reality each copy points to each other copy.
+
+2. On the graph above: **obs. 4** points to **obs. 5 and 9**, **obs. 6** points to **obs. 5 and 9** and **they don't point to each other**; in the table obs. 4 and 6 have **the same coordinates** and therefore represent **the same copy**.
+
+#### A function for calculating number of copies each graph compinent corresponds to
+
+```{r}
+copies <- function(graph.obj) {
+  g.decomp <- decompose(graph.obj, mode = "weak")
+  n.vert <- sapply(g.decomp, function(x) {
+    length(V(x))
+  })
+  n.edge <- sapply(g.decomp, function(x) {
+    length(E(x))
+  })
+  return(n.vert**2 / n.edge)
+}
+
+copies(g3tIR)
+```
+
+Works well, but not all vertices in component number 2 have bidirectional edges. Which contradicts my idea about number of edges.
+
+### Ecoli segment analysis: 0-500Kb, flexible accuracy
+
+For flexible accuracy see below
+
+Make a bed file to get a segment
+
+```{bash}
+#| eval: false
+# BED file must be there - ecoli_segment.bed
+
+seqkit subseq --bed ecoli_segment.bed ecoli_ref_genome.fna > ecoli_segment_1Mb.fasta
+
+blastn -query ecoli_segment_1Mb.fasta -subject ecoli_segment_1Mb.fasta -outfmt 6 -dust no > blast_ecoli1Mb.tsv
+```
+
+
+```{r}
+blast_ecoli <- read.delim("../data/tables/blast_ecoli500kb.tsv", header = FALSE)
+blast_ecoli <- blast_ecoli[-1, ]
+blast_ecoli$observation <- rownames(blast_ecoli)
+blast_ecoli
+```
+
+#### Filtering
+
+How diverse is the identity of matches?
+
+```{r}
+summary(blast_ecoli$V3)
+```
+
+Maybe I should filter out matches with identity lower than 90 or 95.
+
+How diverse is the length of matches?
+
+```{r}
+summary(blast_ecoli$V4)
+```
+
+
+
+With real data et you need both functions: `blast2matrix.for.flex()` and `blast2matrix.rev.flex()`
+
+#### Build a graph on a full dataset
+
+```{r}
+ecoli.mtrx.f <- blast2matrix.for.flex(blast_ecoli, accuracy = 0.15)
+ecoli.mtrx.r <- blast2matrix.rev.flex(blast_ecoli, accuracy = 0.15)
+ecoli.mtrx <- rbind(ecoli.mtrx.f, ecoli.mtrx.r)
+dim(ecoli.mtrx)
+```
+
+
+
+```{r}
+#| fig-height: 10
+#| fig-width: 12
+# this matrix is huge
+# subset it
+g.ecoli <- graph_from_edgelist(ecoli.mtrx)
+plot(g.ecoli, main = "ecoli, segment 500 Kb", vertex.size = 2, vertex.label.dist = 1, edge.arrow.size = .5)
+# vertex.label.dist=.5
+```
+
+```{r}
+#| fig-height: 10
+#| fig-width: 12
+ecoli.cinfo <- cluster_infomap(g.ecoli)
+plot(ecoli.cinfo, g.ecoli, vertex.size = 2, vertex.label.dist = 1, edge.arrow.size = .5)
+```
+
+
+
+```{r}
+ecoli.components <- decompose(g.ecoli, mode = "weak")
+length(ecoli.components)
+```
+
+#### Build a graph on a filtered dataset
+
+Remove matches with identity less than 95
+
+```{r}
+blast_ecoli_filt <- blast_ecoli %>% filter(V3 >= 95)
+```
+
+```{r}
+ecoli.mtrx.f <- blast2matrix.for.flex(blast_ecoli_filt, accuracy = 0.15)
+ecoli.mtrx.r <- blast2matrix.rev.flex(blast_ecoli_filt, accuracy = 0.15)
+ecoli.mtrx <- rbind(ecoli.mtrx.f, ecoli.mtrx.r)
+dim(ecoli.mtrx)
+```
+
+```{r}
+#| fig-height: 10
+#| fig-width: 12
+# this matrix is huge
+# subset it
+g.ecoli <- graph_from_edgelist(ecoli.mtrx)
+plot(g.ecoli, main = "ecoli filt, segment 500 Kb", vertex.size = 2, vertex.label.dist = 1, edge.arrow.size = .5)
+# vertex.label.dist=.5
+```
+
+#### Number of copies
+
+In both filtered and full graphs I have non-integer number of repeat copies, which is strange
+
+```{r}
+n.copies <- copies(g.ecoli)
+n.copies
+```
+
+Number of clusters with wrong number of copies
+
+```{r}
+sum(sapply(n.copies, function(x) {
+  x %% 1 > 0
+}))
+```
+
+
+#### Why decimals?
+
+According to the formula V^2/E there can be three reasons:
+
+1. V is wrong -> I skip some observations, because accuracy is not optimal (coordinates do not match)
+
+2. E is wrong -> I skip some connections, because accuracy is not optimal (other reasons?..)
+
+3. Both are wrong
+
+How can I check it?
+
+If the number of observations equals the number of vertices, then everything from the table was transferred to the graph.
+
+If *n.rows* > *V*, then some rows (observations) were not transferred - it will cause what I described in reason 1 above.  Accuracy adjustments and a table filtering might help.
+
+A situation when *n.rows* < *V* is impossible.
+
+Let's check it
+
+```{r}
+nrow(blast_ecoli) == length(V(g.ecoli))
+```
+
+None of the observations were lost on the way to graph. The global V is correct, but some components' V might be incorrect because of skipped connections (edges)
+
+### Optimal accuracy
+
+#### Strict accuracy
+
+```{r}
+accuracies <- seq(10, 200, 5)
+
+# for each accuracy value build a graph, calculate N of copies, plot them
+
+test.copies <- sapply(accuracies, function(A) {
+  m <- rbind(blast2matrix_for(blast_ecoli, A), blast2matrix_rev(blast_ecoli, A))
+  g <- graph_from_edgelist(m)
+  n.comp <- count_components(g)
+  n.vert <- length(V(g)) # should not change
+  n.edges <- length(E(g)) # may change
+  n.cop <- copies(g)
+  n.dec <- sum(sapply(n.cop, function(x) {
+    x %% 1 > 0
+  }))
+  return(c(n.dec, n.comp, n.vert, n.edges))
+})
+
+n.decimals <- test.copies[1, ]
+n.components <- test.copies[2, ]
+n.vertices <- test.copies[3, ] / 10
+n.edges <- test.copies[4, ] / 10
+
+copies.accuracies.df <- data.frame("accuracy" = accuracies, "n.decimals" = n.decimals, "n.components" = n.components, "n.vertices" = n.vertices, "n.edges" = n.edges)
+```
+
+```{r}
+copies.accuracies.df
+```
+
+
+```{r}
+copies.accuracies.df.tidy <- gather(copies.accuracies.df, "param", "value", 2:5)
+
+ggplot(copies.accuracies.df.tidy, aes(accuracy, value)) +
+  geom_point(aes(color = param)) +
+  geom_line(aes(color = param)) +
+  coord_trans(y = "log")
+```
+
+#### Flexible accuracy
+
+```{r}
+accuracy.perc <- c(0.01, 0.05, 0.07, 0.1, 0.15, 0.20, 0.30)
+
+# for each accuracy value build a graph, calculate N of copies, plot them
+
+test.copies <- sapply(accuracy.perc, function(A) {
+  m <- rbind(blast2matrix.for.flex(blast_ecoli, A), blast2matrix.rev.flex(blast_ecoli, A))
+  g <- graph_from_edgelist(m)
+  n.comp <- count_components(g)
+  n.vert <- length(V(g)) # should not change
+  n.edges <- length(E(g)) # may change
+  n.cop <- copies(g)
+  n.dec <- sum(sapply(n.cop, function(x) {
+    x %% 1 > 0
+  }))
+  return(c(n.dec, n.comp, n.vert, n.edges))
+})
+
+n.decimals <- test.copies[1, ]
+n.components <- test.copies[2, ]
+n.vertices <- test.copies[3, ] / 10
+n.edges <- test.copies[4, ] / 10
+
+copies.accuracies.flex.df <- data.frame("accuracy" = accuracy.perc, "n.decimals" = n.decimals, "n.components" = n.components, "n.vertices" = n.vertices, "n.edges" = n.edges)
+```
+
+```{r}
+copies.accuracies.flex.df
+```
+
+
+```{r}
+copies.accuracies.flex.df.tidy <- gather(copies.accuracies.flex.df, "param", "value", 2:5)
+
+ggplot(copies.accuracies.flex.df.tidy, aes(accuracy, value)) +
+  geom_point(aes(color = param)) +
+  geom_line(aes(color = param))
+```
+
+### E.coli's component 2
+
+```{r}
+ecoli.components[[2]]
+```
+
+n = 4^2/6 = 2.666667
+
+```{r}
+blast_ecoli %>% filter(observation == 16 | observation == 17 | observation == 35 | observation == 34)
+```
+
+
+```{r}
+plot(ecoli.components[[2]])
+```

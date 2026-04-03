@@ -1,0 +1,734 @@
+---
+title: "Using BLAST and Unsupervised ML for genomic repeats identification"
+output:
+  html_document:
+    df_print: paged
+    toc: true
+    toc_float: true
+    code_folding: hide
+---
+
+```{r, message=FALSE, echo=FALSE}
+library(dplyr)
+library(ggplot2)
+library(cluster)
+
+setwd("~/GoogleDrive/HeteroR/tests/blast_for_repeats")
+```
+
+# Introduction
+
+Using BLAST it is possible to discover repeated sequences in a genome fast and computationally efficient.
+The question is how to make a sense out of BLAST output, i.e. how to turn repeated matches in repeat instances with coordinates
+
+My aim is to
+
+  - get borders/coordinates of each repeated unit, 
+  - output repeated unit as fasta string, 
+  - find families of repeated units
+
+# Using BLAST to visually identify repeated regions
+
+## BLAST on a test dataset
+
+Randomly generated DNA sequence 100 kbp long with 11 repeated sequences (50 bp each) inserted in certain positions (see the code below).
+
+
+### Generate a genome with 11 repeated sequences
+
+*Remove the repeat unit or modify the script's output*
+
+```{bash, eval=FALSE}
+python gr_generator.py -gl 100000 -rl 50 -p 1000,5000,6000,8000,10000,15000,20000,50000,70000,80000,90000 -o gengen_11IR50bp.fasta
+
+# Remove the repeat unit or modify the script's output!!!
+blastn -query gengen_11IR50bp.fasta -subject gengen_11IR50bp.fasta -outfmt 6 -dust no > blast_11IR50bp.tsv
+```
+
+### Read blast results
+
+```{r}
+blast_11IR50 <- read.delim("blast_11IR50bp.tsv", header = FALSE)
+blast_11IR50 <- blast_11IR50[-1,] 
+blast_11IR50
+```
+
+### Plot the resuts
+
+```{r fig.height=6, fig.width=12}
+ggplot(blast_11IR50, aes(V7, V8)) +
+  geom_jitter(alpha=0.5, aes(size=V4)) +
+  coord_trans(y="sqrt", x="sqrt") +
+  scale_x_continuous(breaks = c(1000,5000,6000,8000,10000,15000,20000,50000,70000,80000,90000)) +
+  scale_y_continuous(breaks = c(1000,5000,6000,8000,10000,15000,20000,50000,70000,80000,90000)) +
+  xlab("start") +
+  ylab("end")
+```
+
+
+All four repeats are clearly visible
+
+Uncertainty of coordinates of each individual repeat is reflected in circles diameter and transparency.
+
+## BLAST on the real E.coli chromosome
+
+MG1655 reference genome
+
+### Run BLAST
+
+```{bash, eval=FALSE}
+cd ~/Data/HeteroR/test_dir/GRF/generated_genome
+blastn -query Ecoli_MG1655_genome.fna -subject Ecoli_MG1655_genome.fna -outfmt 6 -dust no > blast_MG1655.tsv
+```
+
+
+```{r}
+blast_ecoli <- read.delim("blast_MG1655.tsv", header=F)
+blast_ecoli <- blast_ecoli[-1,]
+blast_ecoli
+```
+
+### Repeat clusters plots
+
+```{r fig.height=10, fig.width=22}
+library(cowplot)
+
+ecoli_plot_full <- ggplot(blast_ecoli, aes(V7, V8)) + 
+                      geom_jitter(alpha=0.3, aes(size=V4)) +
+                      coord_trans(y="log", x="log")+
+                      guides(size=guide_legend(title="length"))+
+                      ggtitle("E.coli MG1655: repeat clusters, full chromosome")+
+                      xlab("position V7")+
+                      ylab("position V8")
+
+ecoli_plot_0_10k <- ggplot(filter(blast_ecoli, V7 > 0 & V7 < 10000), aes(V7, V8)) + 
+                      geom_point(alpha=0.3, aes(size=V4)) +
+                      guides(size=guide_legend(title="length"))+
+                      ggtitle("E.coli MG1655: repeat clusters, 0-10 kbp")+
+                      xlab("position V7")+
+                      ylab("position V8")
+
+ecoli_plot_10k_50k <- ggplot(filter(blast_ecoli, V7 > 10000 & V7 < 50000), aes(V7, V8)) + 
+                        geom_point(alpha=0.3, aes(size=V4))+
+                        guides(size=guide_legend(title="length"))+
+                        ggtitle("E.coli MG1655: repeat clusters, 10-50 kbp")
+
+ecoli_plot_1m_1.5m <- ggplot(filter(blast_ecoli, V7 > 1000000 & V7 < 1500000), aes(V7, V8)) + 
+                        geom_point(alpha=0.3, aes(size=V4))+
+                        guides(size=guide_legend(title="length"))+
+                        ggtitle("E.coli MG1655: repeat clusters, 1-1.5 Mbp")+
+                        xlab("position V7")+
+                        ylab("position V8")
+
+plot_grid(ecoli_plot_full, ecoli_plot_0_10k, ecoli_plot_10k_50k, ecoli_plot_1m_1.5m, nrow=2)
+```
+
+# Clustering
+
+How to cluster these points?
+
+
+matrix -> distance object -> clustering algorithm -> number of clusters based on MIN distance between clusters (is it in some specific algorithm?). This distance should be defined by us
+
+## Test case on a simple matrix 4 dots (2 clusters)
+
+In principal you just need a matrix where each row is a dot and columns are the coordinates.
+
+[source](https://www.statmethods.net/advstats/cluster.html)
+
+A(1,4)
+B(5,6)
+C(2,3)
+D(6,7)
+
+```{r}
+dot_matrix <- matrix(c(1,4,5,6,2,3,6,7,2,4,5.5,5), nrow = 6, ncol=2, byrow = T)
+dot_matrix
+```
+
+```{r}
+plot(dot_matrix)
+```
+
+### Calculate the distances
+
+```{r}
+# mydata <- scale(mydata)
+do <- dist(dot_matrix)
+do
+```
+
+### Apply k-means
+
+```{r}
+fit <- kmeans(dot_matrix, 2)
+
+# get cluster means
+aggregate(dot_matrix , by=list(fit$cluster),FUN=mean)
+# append cluster assignment
+my_clusters <- data.frame(dot_matrix, fit$cluster) 
+my_clusters
+```
+
+### Plot the clusters
+
+```{r fig.height=5, fig.width=8}
+# Cluster Plot against 1st 2 principal components
+
+# vary parameters for most readable graph
+
+clusplot(dot_matrix, fit$cluster, color=TRUE, shade=TRUE,
+   labels=2, lines=0)
+```
+
+
+Everything looks good except the fact that k-means is not suitable in case of blast output table, because it requires predefined number of clusters and it assigns them randomly
+
+## k-means on the real data
+
+### Generated genome with 11 clusters (repeats)
+
+Is scaling really needed here?
+
+```{r}
+
+# function here returns matrix and clustering object (k-means)
+
+getClusters <- function(blast_table, n.clusters){
+  mtrx <- as.matrix(blast_table[,c(7,8)])
+  fit <- kmeans(mtrx, centers = n.clusters)
+  return(list(mtrx, fit))
+}
+
+```
+
+#### k-means doesn't really work
+
+```{r fig.height=5, fig.width=8}
+set.seed(110)
+clusters.list.11IR50 <- getClusters(blast_11IR50, 11)
+
+clusplot(clusters.list.11IR50[[1]], clusters.list.11IR50[[2]]$cluster, color=TRUE, shade=TRUE,
+   labels=5, lines=0, main="Bivariate cluster plot: genome 11IR50bp")
+```
+
+k-means identifies the repeated regions incorrectly most of the time. It's stochastic, every time you run it you'll get slightly different results.
+
+## Hierarchical clustering
+
+Hierarchical clustering fits better here because it is a "connectivity based" approach - "hierarchical models based on connecting objects using a particular similarity or distance metric" (source)[https://cran.r-project.org/web/packages/diceR/vignettes/overview.html]
+
+### Clustering of the generated genome with 11 repeats
+
+```{r fig.height=6, fig.width=19}
+mtrx.11IR50 <- as.matrix(blast_11IR50[,c(7,8)])
+dist.11IR50 <- dist(mtrx.11IR50)
+
+hc.11IR50 <- hclust(dist.11IR50)
+plot(hc.11IR50)
+
+rect.hclust(hc.11IR50,
+  k = 11, # k is used to specify the number of clusters
+  border = "blue"
+)
+```
+
+The lower level clusters ("combs") represent real clusters (repeats)
+
+```{r}
+membership <- as.data.frame(cutree(hc.11IR50,11))
+
+```
+
+Cluster no. 1
+
+```{r}
+membership %>% filter(membership==1)
+```
+This cluster no. 1 corresponds to "comb" no. 7 (left to right) on the dendrogram
+
+#### How many members in each cluster?
+
+```{r}
+table(membership)
+```
+
+Looks good! Every cluster contains 10 members, as it should be
+
+#### Determine number of clusters
+
+Cut the dendrogram by height
+
+```{r}
+library(phylogram)
+
+den.hc.11IR50 <- as.dendrogram(hc.11IR50)
+
+# cut it at height 100
+den.cut <- cut(den.hc.11IR50, 100)
+
+length(den.cut$lower)
+```
+There are 11 clusters where each element is maximum 100 distance units away from another element of this cluster.
+What is the lowest distance that gives the same 11 clusters?
+
+As a clue:
+
+```{r}
+summary(blast_11IR50$V4)
+```
+Hits lengths in the blast table vary from 50 to 65 bp - range = 15
+
+#### Barplot of hights
+
+from [here](https://statsandr.com/blog/clustering-analysis-k-means-and-hierarchical-clustering-by-hand-and-in-r/#hierarchical-clustering)
+
+```{r fig.width=12}
+barplot(hc.11IR50$height,
+  names.arg = (nrow(mtrx.11IR50) - 1):1 # show the number of cluster below each bars
+)
+```
+
+
+#### Plot the optimal distance cut-off value
+
+```{r fig.height=6, fig.width=14}
+distances <- c(100, 50, 25, 20, 18, 17, 16, 15, 14, 13, 12, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1)
+
+n_clusters <- sapply(distances, function(x){length(cut(den.hc.11IR50, x)$lower)})
+
+cluster_count_df <- data.frame("min.distance"=distances, "n.clusters"=n_clusters)
+
+ggplot(cluster_count_df, aes(min.distance, n.clusters)) + 
+  geom_point() + 
+  geom_hline(yintercept=11, linetype="dashed") +
+  scale_x_reverse(breaks=c(100, 50, 25, 20, 18, 16, 14, 12, 10, 8, 6, 4, 2)) +
+  scale_y_continuous(breaks = c(11, 20, 30, 40))
+
+```
+
+So, 15 is the last distance cut-off value that returns 11 clusters, also 15 is the range of hits' length in the blast table.
+But the distance cut-off 48.45 (0.95*median length hit - see below for explanation) will also work as we can see from the picture above.
+
+#### General methods of determining number of clusters
+
+>Note that determining the number of clusters using the dendrogram or barplot is not a strict rule. You can also consider other methods such as the silhouette plot, elbow plot or some numerical measures like Dunn’s index, Hubert’s gamma, etc., which show the variation of the error with the number of clusters (k), and you choose the value of k where the error is smallest. Furthermore, measuring the goodness of clusters can be done thanks to the Dunn’s Index (the higher the index, the better).
+
+[source](https://statsandr.com/blog/clustering-analysis-k-means-and-hierarchical-clustering-by-hand-and-in-r/#hierarchical-clustering)
+
+More about strict rules [here](http://www.sthda.com/english/wiki/wiki.php?id_contents=7952#internal-clustering-validation-measures)
+
+#### Cluster composition:
+
+Cluster no. 1
+
+```{r}
+plot(den.cut$lower[[1]])
+```
+All elements are within 4 distance units, all the same elements that constitute cluster no. 1
+
+other cluster compositions:
+
+Cluster no. 7 (1)
+
+```{r}
+plot(den.cut$lower[[7]])
+
+```
+
+Max distance is 6
+
+Cluster no. 11
+
+```{r}
+plot(den.cut$lower[[11]])
+```
+Max distance is 12
+
+### Clustering of E.coli chromosome segment 10 kbp - 50 kbp
+
+#### BLAST plot
+
+```{r fig.width=10}
+ecoli_plot_10k_50k
+```
+I'd say there are 7 clusters (i.e. repeats)
+
+*Centroid method* of distances calculation "calculates centroids for both clusters, then computes the distance between the two before merging them",
+This method is intuitively fitting here better than *single*, *complete*.
+
+*Ward's criterion* and *average* may be other options here.
+
+```{r fig.height=6, fig.width=19}
+mtrx.ecoli <- as.matrix(blast_ecoli %>% 
+                          filter(V7 > 10000 & V7 < 50000) %>% 
+                          select(V7, V8))
+
+dist.ecoli <- dist(mtrx.ecoli)
+
+hc.ecoli <- hclust(dist.ecoli, method = "centroid")
+plot(hc.ecoli)
+
+```
+Branch labels are row names in the blast table
+
+#### Hits lengths range
+
+```{r}
+subset10.50 <- blast_ecoli %>% 
+                          filter(V7 > 10000 & V7 < 50000)
+summary(subset10.50$V4)
+```
+
+#### Optimal distance cut-off value
+
+ODCOV should be such distance between elements in a cluster that everything more distant we will consider as not related to that cluster.
+
+1. We can try ODCOV based on match length range
+
+Here, if $ODCOV=1*R$ where R is hits' length range $R=max hit length - minhitlength$, number of clusters will be 6, while it should be 7.
+
+One can adjust range, say multiply it by 0.5
+
+If $ODCOV = 0.5 * R$ then number of clusters is 7.
+
+```{r}
+dist_cutoff <- (range(subset10.50$V4)[2] - range(subset10.50$V4)[1])/2
+dist_cutoff
+```
+
+But dividing Range by 2 looks very arbitrarily here, even though it gets me 7 clusters.
+
+2. We can try ODCOV based on matches' median length
+
+If you aligned hits of one repeat unit, you’d get an aligned “body” and not aligned overhangs
+
+This “body” should take some reasonable share of repeat unit length, say, 80% or higher, so that “fuzzy ends” (made by overhangs) would make up 20% or the repeat unit’s length or even less.
+
+In the formula below I use strict coefficient 0.95 that works, because 0.7 gives me 8 clusters.
+
+$ODCOV = 0.95*\overline{m_{l}}$ where $\overline{m_{l}}$ is median length of hits
+
+```{r}
+dist_cutoff <- 0.95*median(subset10.50$V4)
+dist_cutoff
+```
+
+So, again we have some arbitrary choices that define our results...
+
+```{r}
+den.hc.ecoli <- as.dendrogram(hc.ecoli)
+
+den.hc.ecoli.cut <- cut(den.hc.ecoli, dist_cutoff)
+
+length(den.hc.ecoli.cut$lower)
+```
+
+Try to get clusters based on your ODCOV
+
+```{r}
+for (i in seq(1, length(den.hc.ecoli.cut$lower))){
+  plot(den.hc.ecoli.cut$lower[[i]], main=paste("Cluster no. ", as.character(i)))
+}
+
+```
+
+
+Here you can see that cluster number 4 is **not a single** cluster. Maximum distance there is 60 d.u. which way too much. Apparently, you need to consider conventional ways of defining number of clusters. 
+
+## Conventional methods of determinig number of clusters 
+
+Even though there are many methods, you need (ideally) one that defines clusters as a group of points within a certain distance X from each other.
+
+Does such method exist?
+
+It might be that compactness measures are the ones that I am looking for.
+
+>Compactness measures evaluate how close are the objects within the same cluster. A lower within-cluster variation is an indicator of a good compactness (i.e., a good clustering). The different indices for evaluating the compactness of clusters are based on distance measures such as the cluster-wise within average/median distances between observations.
+
+Generally, most of the indices used for internal clustering validation combine compactness and separation measures as follows:
+
+$Index = (\alpha * Separation) / (\beta * Compactness)$
+
+where $\alpha$ and $\beta$ are weights
+
+Two most commonly used indices for assessing the goodness of clustering: silhouette width and Dunn index
+
+### Silhouette analysis
+
+Silhouette width can be interpreted as follows:
+
+- Observations with a large Si (almost 1) are very well clustered
+
+- A small Si (around 0) means that the observation lies between two clusters
+
+- Observations with a negative Si are probably placed in the wrong cluster.
+
+#### Apply silhouette analysis to 11IR50 data
+
+It looks very good
+
+silhouette object description
+
+- The cluster number of each observation i
+
+- The neighbor cluster of i (the cluster, not containing i, for which the average dissimilarity between its observations and i is minimal)
+
+- The silhouette width si of each observation
+
+```{r}
+library(cluster)
+# x - integer vector containing cluster assigning of observations
+# dist - a dissimilarity object created by function dist()
+sil.hc.11IR50 <- silhouette(x = cutree(hc.11IR50, 11), dist.11IR50)
+sil.hc.11IR50
+```
+
+```{r}
+plot(sil.hc.11IR50, main ="Silhouette plot - Hierarchical clustering 11IR50")
+```
+
+Perfect clustering!
+
+#### Apply silhouette analysis to E.coli segment with 7 clusters
+
+```{r}
+# x - integer vector containing cluster assigning of observations
+# dist - a dissimilarity object created by function dist()
+sil.hc.ecoli <- silhouette(x = cutree(hc.ecoli, 7), dist.ecoli)
+sil.hc.ecoli
+```
+
+```{r}
+plot(sil.hc.ecoli, main ="Silhouette plot - Hierarchical clustering E.coli segment 7")
+```
+
+Average is pretty good, but some observations lie between two clusters (Si=0)
+
+If you cut the dendrogram into clusters based on distance not number of clusters?
+
+N.B. methods 'centroid' and 'median' will not allow you to cut tree based on heights!
+
+Remember that you've decided that another options for distance measuring are methods 'average' and 'ward.D'
+
+```{r, fig.width=8}
+hc.ecoli <- hclust(dist.ecoli, method = "ward.D")
+plot(hc.ecoli)
+```
+
+```{r, fig.width=8}
+hc.ecoli <- hclust(dist.ecoli, method = "average")
+plot(hc.ecoli)
+```
+
+```{r, fig.width=10}
+
+mean_silhouette <- function(dist.obj, min_dist_cutoff){
+  hc.obj <- hclust(dist.obj, method = "average")
+  hc.cut <- cutree(hc.obj, h=min_dist_cutoff)
+  sil.obj <- silhouette(x = hc.cut, dist.ecoli)
+  ave.sil <- mean(sapply(c(1:(length(sil.obj)/3)), function(x){sil.obj[x,3]}))
+  return(ave.sil)
+}
+
+clus.stat.df <- data.frame("min.dist.cutoff"=c(5, 10, 20, 50, 52, 53, 54, 55, 60, 70, 85, 100, 150, 200, 250))
+clus.stat.df$sil.size <- sapply(clus.stat.df$min.dist.cutoff, function(y){mean_silhouette(dist.ecoli, y)})
+
+clus.stat.df
+```
+
+```{r}
+ggplot(clus.stat.df, aes(min.dist.cutoff, sil.size)) +
+  geom_point() +
+  geom_line()
+```
+
+
+min dist 53 to 100 and 7 clusters are optimal. Looks like truth.
+
+```{r, fig.width=8}
+hc.cut.ecoli <- cutree(hc.ecoli, h=53)
+sil.hc.ecoli <- silhouette(x = hc.cut.ecoli, dist.ecoli)
+plot(sil.hc.ecoli, main = "Silhouette plot - Hierclust E.coli segment 7, min dist = 60")
+```
+
+```{r}
+library(factoextra)
+
+fviz_silhouette(sil.hc.ecoli)
+```
+
+
+### Dunn Index
+
+Dunn Index is another internal clustering validation measure
+
+$D = min.separation/max.diameter$
+
+If the data set contains compact and well-separated clusters, the diameter of the clusters is expected to be small and the 
+distance between the clusters is expected to be large. Thus, Dunn index should be maximized.
+
+#### Simulated data 11IR50
+
+```{r}
+library(fpc)
+```
+
+
+```{r}
+clus.stat.hc.11IR50 <- cluster.stats(d = dist.11IR50, clustering = cutree(hc.11IR50, 11))
+```
+
+```{r}
+clus.stat.hc.11IR50$within.cluster.ss
+```
+
+```{r}
+clus.stat.hc.11IR50$clus.avg.silwidths
+```
+
+#### E.coli segment
+
+```{r}
+clus.stat.df$dunn2 <- sapply(clus.stat.df$min.dist.cutoff, function(x){
+  stat.obj <- cluster.stats(d = dist.ecoli, clustering = cutree(hc.ecoli, h=x))
+  return(stat.obj$dunn2)
+  })
+
+clus.stat.df$dunn <- sapply(clus.stat.df$min.dist.cutoff, function(x){
+  stat.obj <- cluster.stats(d = dist.ecoli, clustering = cutree(hc.ecoli, h=x))
+  return(stat.obj$dunn)
+  })
+
+clus.stat.df$n.clusters <- sapply(clus.stat.df$min.dist.cutoff, function(x){
+  length(unique(cutree(hc.ecoli, h=x)))
+})
+#clus.stat.hc.ecoli <- cluster.stats(d = dist.ecoli, clustering = cutree(hc.ecoli, h=53))
+#clus.stat.hc.ecoli$dunn2
+
+clus.stat.df
+```
+The higher Dunn index gets, the better
+
+Summarize all clustering statistics
+
+```{r, fig.width=10}
+library(tidyr)
+
+clus.stat.df.tidy <- gather(clus.stat.df, "statistic", "value", 2:5)
+
+ggplot(clus.stat.df.tidy, aes(min.dist.cutoff, value)) +
+  geom_point(aes(color=statistic)) +
+  geom_line(aes(color=statistic)) +
+  coord_trans("sqrt")
+```
+Interesting: between min.dist.cutoff 150 and 200 number of clusters drops (from 9 to 8) while Dunn2 index increases.
+
+## Find members of clusters
+
+If number of clusters are correct and we are done with that, then we can look at what lines from the blast table are grouped together.
+
+All lines grouped together represent copies of *one repeat instance* and should be similar in length.
+
+### E.coli segment
+
+Cut cluster object at the optimal height (see previous section - minimal distance cut-off)
+If we assume that the optimal distance cut-off lies between 50 and 150, then number of clusters should be 9,  but blast plot shows us 7 clearly defined clusters.
+Could it be that some clusters are so close that I can't see them on the plot?
+
+Let's look at the blast plots again
+
+
+```{r fig.height=10, fig.width=22}
+ecoli.19.25 <- ggplot(filter(blast_ecoli, V7 > 19000 & V7 < 25000), aes(V7, V8)) + 
+                        geom_point(alpha=0.3, aes(size=V4))+
+                        guides(size=guide_legend(title="length"))+
+                        ggtitle("E.coli MG1655: repeat clusters, 19-25 kbp")+
+                        coord_trans(x="log", y="log")
+
+ecoli.10.25 <- ggplot(filter(blast_ecoli, V7 > 10000 & V7 < 25000), aes(V7, V8)) + 
+                        geom_point(alpha=0.3, aes(size=V4))+
+                        guides(size=guide_legend(title="length"))+
+                        ggtitle("E.coli MG1655: repeat clusters, 10-25 kbp")+
+                        coord_trans(x="log", y="log")
+
+ecoli.25.27 <- ggplot(filter(blast_ecoli, V7 > 25000 & V7 < 27000), aes(V7, V8)) + 
+                        geom_point(alpha=0.3, aes(size=V4))+
+                        guides(size=guide_legend(title="length"))+
+                        ggtitle("E.coli MG1655: repeat clusters, 25-27 kbp")+
+                        coord_trans(x="log", y="log")
+
+plot_grid(ecoli_plot_10k_50k + 
+            geom_rect(aes(xmin=15000, xmax=21000, ymin=15000, ymax=22000), alpha=0, fill="white", color="red", size=0.1) + 
+            geom_rect(aes(xmin=25000, xmax=28000, ymin=25000, ymax=28000), alpha=0, fill="white", color="red", size=0.1), 
+          ecoli.10.25, ecoli.19.25, ecoli.25.27)
+```
+
+Ok, there can be 8 or 9 clusters, not 7
+
+```{r}
+membership <- as.data.frame(cutree(hc.ecoli, h=200))
+names(membership) <- c('cluster')
+membership$observation <- seq(nrow(membership))
+membership
+```
+Let's look at the size of clusters
+
+There are 8 clusters with height 200 and 9 clusters with height 53 (ward.D)
+
+```{r}
+membership %>% group_by(cluster) %>% summarize(N=n())
+```
+
+Again: All lines grouped together represent copies of *one repeat instance* and should be similar in length.
+
+
+
+# Create a random genome with 2 types of repeats in several positions each
+
+```{bash, eval=FALSE}
+# first, generate sequence with 40 random repeats 50 bp each
+python gr_generator.py -gl 100000 -rl 50 -p 1000,6000,50000,90000 -o gengen_4IR50bp.fasta
+# remove that stupid lat record in the generated genome 
+
+# use seqkit to insert another repeat type
+seqkit mutate -i 30000:CATCGCTTCCTAGTTCCGCTGGGATCCATCGTTGGCGGCCGAAGCCGCCATTCCATAGTGAGTTCTTCGTCTGAGTCATT gengen_4IR50bp.fasta | seqkit mutate -i 70000:CATCGCTTCCTAGTTCCGCTGGGATCCATCGTTGGCGGCCGAAGCCGCCATTCCATAGTGAGTTCTTCGTCTGAGTCATT > gengen_2tIR_4-50_2-80.fasta
+
+# run blast
+blastn -query gengen_2tIR_4-50_2-80.fasta -subject gengen_2tIR_4-50_2-80.fasta -outfmt 6 -dust no > blast_2tIR_4-50_2-80.tsv
+```
+
+## Read blast results
+
+```{r}
+blast_2tIR <- read.delim("blast_2tIR_4-50_2-80.tsv", header = FALSE)
+blast_2tIR <- blast_2tIR[-1,] 
+blast_2tIR$observation <- rownames(blast_2tIR)
+blast_2tIR
+```
+
+## Plot the resuts
+
+```{r fig.height=6, fig.width=12}
+ggplot(blast_2tIR, aes(V7, V8)) +
+  geom_jitter(alpha=0.5, aes(size=V4)) +
+  coord_trans(y="sqrt", x="sqrt") +
+  scale_x_continuous(breaks = c(1000,6000,30000,50000,70000,90000)) +
+  scale_y_continuous(breaks = c(1000,6000,30000,50000,70000,90000)) +
+  xlab("start") +
+  ylab("end")
+```
+Now, what you should find is two clusters, corresponding to two kinds of repeats
+
+### Clustering
+
+```{r}
+mtrx.2tIR <- as.matrix(blast_2tIR %>% select(V7, V8))
+
+dist.2tIR <- dist(mtrx.2tIR)
+
+hc.2tIR <- hclust(dist.2tIR, method = "average")
+plot(hc.2tIR)
+```
+
+This clustering is wrong because observations 2 and 3 must form a single cluster and the rest - another cluster.

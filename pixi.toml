@@ -1,0 +1,31 @@
+[workspace]
+authors = ["andrewgull <andrei.guliaev@scilifelab.uu.se>"]
+channels = ["conda-forge", "bioconda"]
+name = "grabarr"
+platforms = ["osx-arm64"]
+version = "0.1.0"
+
+[tasks]
+style = "Rscript -e 'styler::style_file(\"notebooks/notebook_graphs.Rmd\")'"
+lint = "Rscript -e 'if(length(lintr::lint(\"notebooks/notebook_graphs.Rmd\")) > 0) stop(\"Linting errors found!\")'"
+
+[dependencies]
+python = "==3.12.8"
+blast = ">=2.16.0,<3"
+biopython = ">=1.87,<2"
+seqkit = ">=2.13.0,<3"
+pycodestyle = ">=2.14.0,<3"
+pytest = ">=9.0.2,<10"
+r-dplyr = ">=1.2.0,<2"
+r-ggplot2 = ">=4.0.2,<5"
+r-igraph = ">=2.1.4,<3"
+r-tidyr = ">=1.3.2,<2"
+r-rmarkdown = ">=2.31,<3"
+r-knitr = ">=1.51,<2"
+r-jsonlite = ">=2.0.0,<3"
+r-styler = ">=1.11.0,<2"
+r-lintr = ">=3.3.0_1,<4"
+r-testthat = ">=3.3.1,<4"
+radian = ">=0.6.15,<0.7"
+quarto = ">=1.8.27,<2"
+r-base = ">=4.5.3,<4.6"
