@@ -19,8 +19,10 @@ __pycache__/
 CLAUDE.md
 *.html
 
-# genomes
+# genomes and data files
 *.fna
+*.fa
 *.fasta
 *.fai
 *.bed
+*.tsv
