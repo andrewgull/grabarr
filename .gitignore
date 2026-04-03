@@ -17,6 +17,7 @@ __pycache__/
 # other
 .DS_Store
 CLAUDE.md
+.env
 *.html
 
 # genomes and data files
